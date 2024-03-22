@@ -74,20 +74,24 @@ func (t *Tree[T]) Set(value T, key ...interface{}) {
 // Get returns the value at the given key.
 //
 // If the key does not exist it returns nil.
-func (t *Tree[T]) Get(key ...interface{}) *T {
-	return t.Branch(key...).v.Load()
+func (t *Tree[T]) Get(key ...interface{}) T {
+	ptr := t.Branch(key...).v.Load()
+	if ptr == nil {
+		ptr = new(T)
+	}
+	return *ptr
 }
 
 // Branch returns the tree at the given key.
 //
 // If the key does not exist it returns nil.
 func (t *Tree[T]) Branch(key ...interface{}) *Tree[T] {
-	if t == nil {
-		return nil
-	}
-
 	if len(key) == 0 {
 		return t
+	}
+
+	if t == nil {
+		return nil
 	}
 
 	t.branchesMutex.RLock()
