@@ -1,2 +1,2 @@
 # strata
-A collection of data structures
+A collection of data structures and data managers
