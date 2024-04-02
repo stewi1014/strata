@@ -10,13 +10,19 @@ import (
 //
 // A Tree must not be copied after first use.
 //
+// It is only possible to traverse down the tree, not up.
+//
+// Don't create loops. Loops are not trees. Tree will recurse infintiely.
+//
 // It is thread safe, but also blocking.
 // It utilises sync.RWMutex and methods only hold the lock for one element at a time.
-type Tree[T any] struct {
-	v atomic.Pointer[T]
+type Tree struct {
+	v atomic.Pointer[interface{}]
+
+	onChange []*func(*Tree)
 
 	branchesMutex sync.RWMutex
-	branches      map[interface{}]*Tree[T]
+	branches      map[interface{}]*Tree
 }
 
 // touch returns the branch at the given key, creating it if neccecary,
@@ -26,7 +32,7 @@ type Tree[T any] struct {
 //
 // Motivation is the duplicate code polluting other functions
 // that's required to deal with the transition from RLock to Lock.
-func (t *Tree[T]) touch(key interface{}) *Tree[T] {
+func (t *Tree) touch(key interface{}) *Tree {
 	// try get to the branch with only a read lock
 	t.branchesMutex.RLock()
 	branch := t.branches[key]
@@ -50,19 +56,30 @@ func (t *Tree[T]) touch(key interface{}) *Tree[T] {
 	}
 
 	if t.branches == nil {
-		t.branches = make(map[interface{}]*Tree[T])
+		t.branches = make(map[interface{}]*Tree)
 	}
 
-	branch = new(Tree[T])
+	branch = new(Tree)
 	t.branches[key] = branch
 	t.branchesMutex.Unlock()
 	return branch
 }
 
+// Get returns the value at the given key.
+//
+// If the key does not exist it returns nil.
+func (t *Tree) Get(key ...interface{}) interface{} {
+	ptr := t.Branch(key...).v.Load()
+	if ptr == nil {
+		ptr = new(interface{})
+	}
+	return *ptr
+}
+
 // Set assigns the value of the given location.
 //
 // It always succeeds, internally creating any branches required to reach the given key.
-func (t *Tree[T]) Set(value T, key ...interface{}) {
+func (t *Tree) Set(value interface{}, key ...interface{}) {
 	if len(key) == 0 {
 		t.v.Store(&value)
 		return
@@ -71,21 +88,17 @@ func (t *Tree[T]) Set(value T, key ...interface{}) {
 	t.touch(key[0]).Set(value, key[1:]...)
 }
 
-// Get returns the value at the given key.
-//
-// If the key does not exist it returns nil.
-func (t *Tree[T]) Get(key ...interface{}) T {
-	ptr := t.Branch(key...).v.Load()
-	if ptr == nil {
-		ptr = new(T)
-	}
-	return *ptr
+// OnChange registers a function that is called when the value is modified.
+func (t *Tree) OnChange(onValue func(*Tree), key ...interface{}) {
+
 }
+
+// On
 
 // Branch returns the tree at the given key.
 //
 // If the key does not exist it returns nil.
-func (t *Tree[T]) Branch(key ...interface{}) *Tree[T] {
+func (t *Tree) Branch(key ...interface{}) *Tree {
 	if len(key) == 0 {
 		return t
 	}
@@ -106,7 +119,7 @@ func (t *Tree[T]) Branch(key ...interface{}) *Tree[T] {
 // If the key does not exist it does nothing and returns nil.
 //
 // If Prune is called with no key, it does nothing and returns itself.
-func (t *Tree[T]) Prune(key ...interface{}) *Tree[T] {
+func (t *Tree) Prune(key ...interface{}) *Tree {
 	if len(key) == 0 {
 		return t
 	}
@@ -133,7 +146,7 @@ func (t *Tree[T]) Prune(key ...interface{}) *Tree[T] {
 //
 // If two elements share the same key the graft takes priority,
 // overwriting values, with branches being merged.
-func (t *Tree[T]) Graft(graft *Tree[T], key ...interface{}) {
+func (t *Tree) Graft(graft *Tree, key ...interface{}) {
 	if t == graft {
 		return
 	}
@@ -174,7 +187,7 @@ func (t *Tree[T]) Graft(graft *Tree[T], key ...interface{}) {
 //
 // The function can modify branches given to it,
 // but cannot modify the parent tree as the read mutex needs to be held.
-func (t *Tree[T]) Range(f func(key interface{}, branch *Tree[T])) {
+func (t *Tree) Range(f func(key interface{}, branch *Tree)) {
 	if t == nil {
 		return
 	}
