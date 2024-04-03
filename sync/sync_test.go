@@ -30,7 +30,7 @@ func TestSync(t *testing.T) {
 	go func() {
 		s := new(sync.Sync)
 		go func() {
-			err := s.Sync(ctx, conn1)
+			err := s.Sync(conn1)
 			if err != nil {
 				done(err)
 			}
@@ -43,7 +43,7 @@ func TestSync(t *testing.T) {
 
 		valueStruct := &TestStruct{}
 		valueStruct.Value1.Set("hello struct")
-		s.RegisterFields(valueStruct)
+		s.RegisterStruct(valueStruct)
 
 		valueStruct.Value2.Set(42)
 	}()
@@ -53,7 +53,7 @@ func TestSync(t *testing.T) {
 
 		s := new(sync.Sync)
 		go func() {
-			err := s.Sync(ctx, conn2)
+			err := s.Sync(conn2)
 			if err != nil {
 				done(err)
 			}
@@ -66,7 +66,7 @@ func TestSync(t *testing.T) {
 		valueStruct := &TestStruct{}
 		valueStructValue1 := changeWait(&valueStruct.Value1)
 		valueStructValue2 := changeWait(&valueStruct.Value2)
-		s.RegisterFields(valueStruct)
+		s.RegisterStruct(valueStruct)
 
 		v2 := <-value2Change
 		if v2 != "hello" {
@@ -90,5 +90,3 @@ func TestSync(t *testing.T) {
 		t.Error(err)
 	}
 }
-
-func Example()

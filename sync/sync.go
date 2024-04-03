@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"net"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -23,26 +24,6 @@ func del[E comparable, S []E](s *S, elem E) int {
 	}
 
 	return -1
-}
-
-// prepend adds one element to the start of the slice
-func prepend[E any, S []E](s *S, elem E) {
-	if len(*s) == 0 {
-		*s = []E{elem}
-		return
-	}
-
-	if cap(*s) > len(*s) {
-		*s = (*s)[:len(*s)+1]
-		copy((*s)[1:], *s)
-		(*s)[0] = elem
-		return
-	}
-
-	new := make(S, len(*s)+1, 2*cap(*s))
-	copy(new[1:], *s)
-	new[0] = elem
-	*s = new
 }
 
 // message is the type given to encoding/gob
@@ -68,6 +49,8 @@ type Sync struct {
 	vptr atomic.Pointer[Valuelike]
 
 	// read only
+	// parent remains even after deletion
+	// see touch
 	parent *Sync
 	key    any
 
@@ -77,261 +60,230 @@ type Sync struct {
 	clients []*client
 }
 
-type client struct {
-	enc  *gob.Encoder
-	dec  *gob.Decoder
-	ctx  context.Context
-	done func(error)
-}
-
 func (s *Sync) isZero() bool {
 	return s == nil || (s.vptr.Load() == nil &&
 		len(s.child) == 0 &&
 		len(s.clients) == 0)
 }
 
-// returns the root node, along with the key of the current node
-// relative to the root node.
-func (s *Sync) root() (root *Sync, key []any) {
-	for s.parent != nil {
-		prepend(&key, s.key)
-		s = s.parent
-	}
+func (s *Sync) walk(f func(s *Sync, key []any), prefix ...any) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	f(s, prefix)
 
-	return s, key
+	for k, v := range s.child {
+		v.walk(f, append(prefix, k)...)
+	}
 }
 
-func (s *Sync) sendAll(client *client, key ...any) {
-	ptr := s.vptr.Load()
-	if ptr != nil {
-		v, t := (*ptr).GetAt()
-		client.send(message{
-			V: v,
-			T: t,
-			K: key,
-		})
-	}
-
+// get returns the value at the given key,
+// returning nil if it doesn't exist.
+func (s *Sync) get(key ...any) Valuelike {
 	s.mutex.RLock()
-	// this approach is taken to
-	// avoid doing the send while holding mutex
-	// or writing to the client with a great number of routines
-	children := make([]*Sync, len(s.child))
-	i := 0
-	for _, v := range s.child {
-		children[i] = v
-		i++
+	for i := range key {
+		next := s.child[key[i]]
+		if next == nil {
+			s.mutex.RUnlock()
+			return nil
+		}
+
+		next.mutex.RLock()
+		s.mutex.RUnlock()
+		s = next
 	}
 	s.mutex.RUnlock()
 
-	for i := range children {
-		children[i].sendAll(client, append(key, children[i].key)...)
+	ptr := s.vptr.Load()
+	if ptr == nil {
+		return nil
 	}
+	return *ptr
 }
 
-// get returns the node at the given key,
-// if it exists.
-func (s *Sync) get(key ...any) *Sync {
-	for i := 0; i < len(key) && s != nil; i++ {
-		s.mutex.RLock()
-		next := s.child[key[i]]
-		s.mutex.RUnlock()
-		s = next
-	}
-
-	return s
-}
-
-// Delete removes the value at the given key,
-// internally cleaning up unused nodes.
+// with allows modifications to a node at a given key.
 //
-// It's the inverse of Register.
-func (s *Sync) Delete(key ...any) {
-	// navigate to the end,
-	// removing the value if it exists
-	for i := 0; ; i++ {
-		if i >= len(key) {
-			// at the end
-			s.vptr.Store(nil)
-			break
-		}
-
-		s.mutex.RLock()
-		next := s.child[key[i]]
-		s.mutex.RUnlock()
-
-		if next == nil {
-			break
-		}
-
-		s = next
+// The write mutex is held, allowing modifications to the node,
+// and the key of the node relative to the root is given.
+//
+// The node and any connectiosn are created if needed.
+func (s *Sync) with(key []any, f func(s *Sync)) {
+	// we could be on a branch removed from the tree,
+	// and someone, somewhere, kept a reference
+	// and now wants to modify a part of it.
+	//
+	// that being said, if this is part of a disconnected branch,
+	// then it should be a single chain of zero-values.
+	//
+	// where does that leave us?
+	// we can go up, populate what we need, but nothing that matters can access it anymore.
+	// running without error is disingenuous,
+	// and the caller wouldn't necessarily have a reasonable way to mitigate this.
+	//
+	// instead I think this motivates parent and key never being touched after creation,
+	// and reconnecting this branch to the tree.
+	// Even if it's empty, the caller still has the reference and wants to make calls.
+	//
+	// no way to know where the break is
+	// or if there's two of them!
+	// so, get to root
+	for s.parent != nil {
+		key = append([]any{s.key}, key...) // don't modify key's original backing array
+		s = s.parent
 	}
 
 	s.mutex.Lock()
-	for s.isZero() && s.parent != nil {
-		s.parent.mutex.Lock()
-		delete(s.parent.child, s.key)
-		s.mutex.Unlock()
-		s = s.parent
-	}
-	s.mutex.Unlock()
-}
-
-// Branch returns the node at the given key,
-// creating nodes as needed to reach it.
-func (s *Sync) Branch(key ...any) *Sync {
-	for i := 0; i < len(key); i++ {
-		s.mutex.RLock()
+	for i := range key {
 		next := s.child[key[i]]
-		s.mutex.RUnlock()
-
 		if next == nil {
-			s.mutex.Lock()
-			next = s.child[key[i]]
-
-			// check again,
-			// as another thread may have created it during the
-			// read -> write lock transition.
-			if next == nil {
-				if s.child == nil {
-					s.child = make(map[any]*Sync)
-				}
-
-				next = new(Sync)
-				next.parent = s
-				next.key = key[i]
-				s.child[key[i]] = next
+			if s.child == nil {
+				s.child = make(map[any]*Sync, 1)
 			}
 
-			s.mutex.Unlock()
+			next = &Sync{
+				parent: s,
+				key:    key[i],
+			}
+			s.child[key[i]] = next
 		}
 
 		s = next
-		key = key[1:]
+		s.mutex.Lock()
+		s.parent.mutex.Unlock()
 	}
 
-	return s
+	defer s.mutex.Unlock()
+	f(s)
 }
 
-func (s *Sync) Sync(ctx context.Context, rw io.ReadWriter) error {
-	c := s.newClient(ctx, gob.NewEncoder(rw), gob.NewDecoder(rw))
-
-	go s.listen(c)
-	go s.sendAll(c)
-
-	<-c.ctx.Done()
-	return context.Cause(c.ctx)
-}
-
-func (s *Sync) SyncTo(ctx context.Context, w io.Writer) error {
-	c := s.newClient(ctx, gob.NewEncoder(w), nil)
-
-	go s.sendAll(c)
-
-	<-c.ctx.Done()
-	return context.Cause(c.ctx)
-}
-
-func (s *Sync) SyncFrom(ctx context.Context, r io.Reader) error {
-	c := s.newClient(ctx, nil, gob.NewDecoder(r))
-
-	go s.listen(c)
-
-	<-c.ctx.Done()
-	return context.Cause(c.ctx)
-}
-
-func (s *Sync) newClient(ctx context.Context, enc *gob.Encoder, dec *gob.Decoder) *client {
+func newClient(ctx context.Context) *client {
 	ctx, done := context.WithCancelCause(ctx)
-
-	c := &client{
-		enc:  enc,
-		dec:  dec,
+	return &client{
 		ctx:  ctx,
 		done: done,
+		send: make(chan *message),
+	}
+}
+
+type client struct {
+	ctx  context.Context
+	done func(error)
+	send chan *message
+}
+
+func (s *Sync) Sync(conn net.Conn) error {
+	c := newClient(context.Background())
+	go s.syncFrom(c, conn)
+	go s.syncTo(c, conn)
+
+	<-c.ctx.Done()
+	return context.Cause(c.ctx)
+}
+
+func (s *Sync) SyncFrom(r io.Reader) error {
+	c := newClient(context.Background())
+	return s.syncFrom(c, r)
+}
+
+func (s *Sync) syncFrom(c *client, r io.Reader) error {
+	dec := gob.NewDecoder(r)
+	var msg message
+
+	for {
+		err := dec.Decode(&msg)
+		if err != nil {
+			c.done(err)
+			return err
+		}
+
+		err = s.recvMessage(c, msg)
+		if err != nil {
+			c.done(err)
+			return err
+		}
+	}
+}
+
+func (s *Sync) recvMessage(c *client, msg message) error {
+	v := s.get(msg.K...)
+	if v == nil {
+		return nil
 	}
 
+	value, t := v.GetAt()
+	if t.After(msg.T) {
+		// already have a newer value
+		// reply with our newer value
+		//
+		// this also allows new clients to
+		// query current values by sending a
+		// zero time.
+
+		msg.T = t
+		msg.V = value
+		s.sendMessage(c, msg)
+		return nil
+	}
+
+	if reflect.TypeOf(value) != reflect.TypeOf(msg.V) {
+		return fmt.Errorf(
+			"bad type for %v received: got %T but have %T",
+			msg.K,
+			msg.V,
+			value,
+		)
+	}
+
+	v.SetAt(msg.V, msg.T)
+	return nil
+}
+
+func (s *Sync) SyncTo(w io.Writer) error {
+	c := newClient(context.Background())
+	return s.syncTo(c, w)
+}
+
+func (s *Sync) syncTo(c *client, w io.Writer) error {
 	s.mutex.Lock()
 	s.clients = append(s.clients, c)
 	s.mutex.Unlock()
 
-	context.AfterFunc(ctx, func() {
+	defer func() {
 		s.mutex.Lock()
 		del(&s.clients, c)
 		s.mutex.Unlock()
+
+		c.done(fmt.Errorf("unknown cause"))
+	}()
+
+	go s.walk(func(s *Sync, key []any) {
+		if ptr := s.vptr.Load(); ptr != nil {
+			v, t := (*ptr).GetAt()
+			c.send <- &message{
+				T: t,
+				K: key,
+				V: v,
+			}
+		}
 	})
 
-	return c
-}
-
-func (s *Sync) listen(client *client) {
+	enc := gob.NewEncoder(w)
 	for {
-		var msg message
-		err := client.dec.Decode(&msg)
+		err := enc.Encode(<-c.send)
 		if err != nil {
-			client.done(err)
-			return
+			c.done(err)
+			return err
 		}
-
-		if err := client.ctx.Err(); err != nil {
-			return
-		}
-
-		node := s.get(msg.K...)
-		if node == nil {
-			// don't have the value
-			continue
-		}
-
-		v := node.vptr.Load()
-		if v == nil {
-			// don't have the value
-			continue
-		}
-
-		value, t := (*v).GetAt()
-		if t.After(msg.T) {
-			// already have a newer value
-			// reply with our newer value
-			//
-			// this also allows new clients to
-			// query current values by sending a
-			// zero time.
-
-			msg.T = t
-			msg.V = value
-			client.send(msg)
-			continue
-		}
-
-		if reflect.TypeOf(value) != reflect.TypeOf(msg.V) {
-			client.done(fmt.Errorf(
-				"bad type for %v received: got %T but have %T",
-				msg.K,
-				msg.V,
-				value,
-			))
-
-			return
-		}
-
-		// propagate the change
-		(*v).SetAt(msg.V, msg.T)
 	}
 }
 
-func (c *client) send(msg message) {
-	if c.enc == nil {
+func (s *Sync) sendMessage(c *client, msg message) {
+	if c.send == nil {
 		return
 	}
 
-	if c.ctx.Err() != nil {
-		return
-	}
-
-	err := c.enc.Encode(&msg)
-	if err != nil {
-		c.done(err)
+	select {
+	case <-c.ctx.Done():
+	case c.send <- &msg:
 	}
 }
 
@@ -346,54 +298,71 @@ func (s *Sync) RegisterStruct(structPtr any) {
 		panic(fmt.Errorf("%v is not a struct", v.Type()))
 	}
 
-	s = s.Branch(v.Type().String())
-
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
 
 		if impl := f.Addr(); impl.Type().Implements(valuelikeType) {
-			name := fmt.Sprintf("[%v]%v", i, v.Type().Field(i).Name)
-			s.Branch(name).register(impl.Interface().(Valuelike))
+			key := []any{
+				v.Type().String(),
+				fmt.Sprintf("[%v]%v", i, v.Type().Field(i).Name),
+			}
+
+			s.Register(impl.Interface().(Valuelike), key...)
+
 			continue
 		}
 
 		if impl := f; impl.Type().Implements(valuelikeType) {
-			name := fmt.Sprintf("[%v]%v", i, v.Type().Field(i).Name)
-			s.Branch(name).register(impl.Interface().(Valuelike))
+			key := []any{
+				v.Type().String(),
+				fmt.Sprintf("[%v]%v", i, v.Type().Field(i).Name),
+			}
+
+			s.Register(impl.Interface().(Valuelike), key...)
+
 			continue
 		}
 	}
 }
 
 func (s *Sync) Register(value Valuelike, key ...interface{}) {
-	s.Branch(key...).register(value)
-}
+	s.with(key, func(s *Sync) {
+		if !s.vptr.CompareAndSwap(nil, &value) {
+			panic(fmt.Errorf("%v is already registered", value))
+		}
 
-func (s *Sync) register(value Valuelike) {
-	if !s.vptr.CompareAndSwap(nil, &value) {
-		panic(fmt.Errorf("%v is already registered", value))
-	}
+		value.OnChange(s.onChange)
+	})
 
-	value.OnChange(s.onChange)
-	s.onChange(value, time.Time{})
+	v, t := value.GetAt()
+	s.onChange(v, t)
 }
 
 func (s *Sync) onChange(value any, when time.Time) {
-	s, key := s.root()
+	var key []any
 
-	for i := range key {
-		s.mutex.RLock()
+	s.mutex.RLock()
+	for {
 		for c := range s.clients {
-			go s.clients[c].send(message{
-				T: when,
-				K: key[i:],
-				V: value,
-			})
+			go s.sendMessage(
+				s.clients[c],
+				message{
+					T: when,
+					K: key,
+					V: value,
+				},
+			)
 		}
 
-		next := s.child[key[i]]
-		s.mutex.RUnlock()
+		if s.parent == nil {
+			s.mutex.RUnlock()
+			return
+		}
 
-		s = next
+		key = append([]any{s.key}, key...)
+
+		s.parent.mutex.RLock()
+		s.mutex.RUnlock()
+		s = s.parent
 	}
 }
